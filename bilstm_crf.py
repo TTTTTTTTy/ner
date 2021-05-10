@@ -7,35 +7,36 @@ import torch.autograd as autograd
 import torch.nn as nn
 from torch.nn.utils.rnn import pad_packed_sequence, pack_padded_sequence
 import torch.optim as optim
+from tagger import Tagger
 
 torch.manual_seed(1)
 
-START_TAG = "<START>"
-STOP_TAG = "<STOP>"
-PAD_TAG = "<PAD>"
 
 # Compute log sum exp in a numerically stable way for the forward algorithm
-def log_sum_exp(vec): # (B, T, T)
-    max_score, _ = torch.max(vec, dim=-1) # [B, T]
-    max_score_broadcast = max_score.unsqueeze(-1).expand(vec.size()) # [B, T, T]
-    return max_score + \
-        torch.log(torch.sum(torch.exp(vec - max_score_broadcast), dim=-1))  # [B, T]
+
 
 class BiLSTM_CRF(nn.Module):
 
-    def __init__(self, device, vocab_size, tag_to_ix, embedding_dim, hidden_dim):
+    def __init__(self, device, vocab_size, embedding_dim, hidden_dim, tagset_size, bidirectional=True, num_layer=2, dropout=0.7):
         super(BiLSTM_CRF, self).__init__()
         self.embedding_dim = embedding_dim
         self.hidden_dim = hidden_dim
         self.vocab_size = vocab_size
-        self.tag_to_ix = tag_to_ix
-        self.tagset_size = len(tag_to_ix)
+        self.tagset_size = tagset_size + 2  # add [START_TAG]、[STOP_TAG]
         self.device = device
+        self.START_TAG = tagset_size
+        self.STOP_TAG =  tagset_size + 1
+        self.num_layer = num_layer
+        self.dropout = dropout
+        self.bidirectional = bidirectional
 
         self.embedding = nn.Embedding(vocab_size, embedding_dim)
-        self.bilstm = nn.LSTM(embedding_dim, hidden_dim,
-                            num_layers=1, batch_first=True, 
-                            bidirectional=True)
+        self.bilstm = nn.LSTM(input_size=embedding_dim, 
+                            hidden_size=hidden_dim, 
+                            num_layers=num_layer, 
+                            dropout=dropout,
+                            batch_first=True, 
+                            bidirectional=bidirectional)
 
         # Maps the output of the LSTM into tag space.
         self.hidden2tag = nn.Linear(2 * hidden_dim, self.tagset_size)
@@ -47,15 +48,25 @@ class BiLSTM_CRF(nn.Module):
 
         # These two statements enforce the constraint that we never transfer
         # to the start tag and we never transfer from the stop tag
-        self.transitions.data[tag_to_ix[START_TAG], :] = -10000
-        self.transitions.data[:, tag_to_ix[STOP_TAG]] = -10000
+        self.transitions.data[self.START_TAG, :] = -10000
+        self.transitions.data[:, self.STOP_TAG] = -10000
+    
+    def print_args(self):
+        return f'embedding dim:{self.embedding_dim}\thidden_dim:{self.hidden_dim}\ttarget_size:{self.tagset_size}' \
+            + f'\tnum_layer:{self.num_layer}\tbidirectional:{self.bidirectional}\tdropout:{self.dropout}'
+    
+    def log_sum_exp(self, vec): # (B, T, T)
+        max_score, _ = torch.max(vec, dim=-1) # [B, T]
+        max_score_broadcast = max_score.unsqueeze(-1).expand(vec.size()) # [B, T, T]
+        return max_score + \
+            torch.log(torch.sum(torch.exp(vec - max_score_broadcast), dim=-1))  # [B, T]
 
     def _forward_alg(self, scores, lengths):
         B, L, T = scores.size()
         # Do the forward algorithm to compute the partition function
         init_alphas = torch.full((B, self.tagset_size), -10000.).to(self.device)
         # START_TAG has all of the score.
-        init_alphas[:,self.tag_to_ix[START_TAG]] = 0.
+        init_alphas[:,self.START_TAG] = 0.
 
         # Wrap in a variable so that we will get automatic backprop
         forward_var = init_alphas  # 每一行： [log(e^p11 + e^p12 ... + e^p1n), log(e^p21 + e^p22 ... + e^p2n), ,,, log(e^pm1 + e^pm2 ... + e^pmn)
@@ -67,9 +78,9 @@ class BiLSTM_CRF(nn.Module):
             emit_score = scores[:batch_size_t, step].unsqueeze(2).repeat(1, 1, T)   # [batch_size_t, T] -> [batch_size_t, T, T]   [[ x1 x1 x1], [x2, x2, x2], [x3, x3, x3]]
             expaned_forward_var = forward_var[:batch_size_t].unsqueeze(1).repeat(1, T, 1) # [batch_size_t, T] -> [batch_size_t, T, T]    [[ p1 p2 p3], [p1, p2, p3], [p1, p2, p3]]
             next_tag_var = expaned_forward_var + self.transitions + emit_score   # [batch_size_t, T, T] entry(k, i, j) = p_j + t_ji + x_i 
-            forward_var[:batch_size_t] = log_sum_exp(next_tag_var)
-        terminal_var = forward_var + self.transitions[self.tag_to_ix[STOP_TAG]] # [B, T]
-        alpha = log_sum_exp(terminal_var) # [B]
+            forward_var[:batch_size_t] = self.log_sum_exp(next_tag_var)
+        terminal_var = forward_var + self.transitions[self.STOP_TAG] # [B, T]
+        alpha = self.log_sum_exp(terminal_var) # [B]
         return alpha
 
     def _get_lstm_scores(self, sents, lengths):
@@ -84,7 +95,7 @@ class BiLSTM_CRF(nn.Module):
         # Gives the score of a provided tag sequence
         B, L, T = scores.size()
         gold_scores = torch.zeros(B).to(self.device)
-        tags = torch.cat([torch.tensor([self.tag_to_ix[START_TAG]], dtype=torch.long).expand((B, 1)).to(self.device), tags], dim=-1) # [B, L+1]
+        tags = torch.cat([torch.tensor([self.START_TAG], dtype=torch.long).expand((B, 1)).to(self.device), tags], dim=-1) # [B, L+1]
         for i in range(L):
             batch_size_t = (lengths > i).sum().item()
             t_tags = tags[:batch_size_t, i+1].view(-1, 1)  # [B,1], reshape for gather
@@ -92,17 +103,17 @@ class BiLSTM_CRF(nn.Module):
             for j in range(batch_size_t):
                 gold_scores[j] += self.transitions[tags[j, i + 1], tags[j, i]]     # 有什么函数可以直接进行矩阵操作吗？
         last_tags = tags.gather(1, (lengths-1).view(-1, 1)).view(-1)
-        gold_scores += self.transitions[self.tag_to_ix[STOP_TAG]].gather(0, last_tags)
+        gold_scores += self.transitions[self.STOP_TAG].gather(0, last_tags)
         return gold_scores
 
     def _viterbi_decode(self, scores, lengths):
 
         B, L, T = scores.size()   # [B, L, tag_size]
-        backpointers = torch.full((B, L, T), self.tag_to_ix[STOP_TAG]).to(self.device)
+        backpointers = torch.full((B, L, T), self.STOP_TAG).to(self.device)
 
         # Initialize the viterbi variables in log space
         init_vvars = torch.full((B, self.tagset_size), -10000.).to(self.device)
-        init_vvars[:, self.tag_to_ix[START_TAG]] = 0
+        init_vvars[:, self.START_TAG] = 0
 
         # forward_var at step i holds the viterbi variables for step i-1
         forward_var = init_vvars
@@ -116,7 +127,7 @@ class BiLSTM_CRF(nn.Module):
             backpointers[:batch_size_t, step] = best_tag_ids
         path_scores = []
         best_paths = []
-        terminal_var = forward_var + self.transitions[self.tag_to_ix[STOP_TAG]]
+        terminal_var = forward_var + self.transitions[self.STOP_TAG]
         _, last_best_ids = torch.max(terminal_var, dim=1)
         backpointers = backpointers.tolist()
         for i in range(B):
@@ -145,6 +156,7 @@ class BiLSTM_CRF(nn.Module):
         return scores, tag_seqs
 
 
+
 def toy_test():
     # Make up some training data
     training_data = [(
@@ -162,37 +174,30 @@ def toy_test():
             if word not in word_to_ix:
                 word_to_ix[word] = len(word_to_ix)
     # get_tag_dictionary
-    tag_to_ix = {"B": 0, "I": 1, "O": 2, START_TAG: 3, STOP_TAG: 4, PAD_TAG: 5}
-    ix_to_tag = {v:k for k, v in tag_to_ix.items()}
+    tag_lst = ["B", 'I', 'O']
+    tagger = Tagger(tag_lst)
 
     # build_model
     device = torch.device("cuda:0") if torch.cuda.is_available() else torch.device("cpu")
     embedding_dim = 10
     hidden_dim = 5
-    model = BiLSTM_CRF(device, len(word_to_ix), tag_to_ix, embedding_dim, hidden_dim)
+    model = BiLSTM_CRF(device, len(word_to_ix), embedding_dim, hidden_dim, len(tag_lst))
+    print(model.print_args())
     model.to(device)
     optimizer = optim.SGD(model.parameters(), lr=0.01, weight_decay=1e-4)
 
-    def batch_prepare_sequence(examples, word_to_idx, tag_to_idx, device):
+    def batch_prepare_sequence(examples, word_to_idx, tagger, device):
         sents = []
-        lengths = []
-        tags = []
-        max_length = len(examples[0][0])
+        tag_ids_lst, lengths = tagger.convert_batch_tags_to_ids([example[1] for example in examples], padding=True)
+        max_length = len(tag_ids_lst[0])
         for example in examples:
             sents.append([word_to_idx[w] for w in example[0]])
-            lengths.append(len(sents[-1]))
             while len(sents[-1]) < max_length:
                 sents[-1].append(0)
-            tags.append([tag_to_idx[tag] for tag in example[1]])
-            while len(tags[-1]) < max_length:
-                tags[-1].append(5)
-        return torch.tensor(sents, dtype=torch.long).to(device), torch.tensor(lengths, dtype=torch.long).to(device), torch.tensor(tags, dtype=torch.long).to(device)
+        return torch.tensor(sents, dtype=torch.long).to(device), torch.tensor(lengths, dtype=torch.long).to(device), torch.tensor(tag_ids_lst, dtype=torch.long).to(device)
 
     # build data 
-    precheck_sent, precheck_lengths, precheck_tags = batch_prepare_sequence(training_data, word_to_ix, tag_to_ix, device)
-
-    def get_tags_from_ids(tags, ix_to_tag):
-        return [ix_to_tag[tag] for tag in tags]
+    precheck_sent, precheck_lengths, precheck_tags = batch_prepare_sequence(training_data, word_to_ix, tagger, device)
 
     # Check predictions before training
     print('\n>>> Before Training:\n')
@@ -202,15 +207,15 @@ def toy_test():
             print(f'Example {i}: ')
             print(f'Question: {training_data[i][0]}')
             print(f'ground truth tags: {training_data[i][1]}')
-            print(f'predict tags: {get_tags_from_ids(paths[i], ix_to_tag)}')
-            print(f'probability: {scores[i].item()}')
+            print(f'predict tags: {tagger.convert_ids_to_tags(paths[i])}')
+            print(f'score: {scores[i].item()}')
             print('========================')
 
 
     # train model
 
     print('\n>>> Start Training:\n')
-    epoch_num = 300
+    epoch_num = 1000
     for epoch in range(epoch_num):
 
         model.zero_grad()
@@ -229,8 +234,8 @@ def toy_test():
             print(f'Example {i}: ')
             print(f'Question: {training_data[i][0]}')
             print(f'ground truth tags: {training_data[i][1]}')
-            print(f'predict tags: {get_tags_from_ids(paths[i], ix_to_tag)}')
-            print(f'probability: {scores[i].item()}')
+            print(f'predict tags: {tagger.convert_ids_to_tags(paths[i])}')
+            print(f'score: {scores[i].item()}')
             print('========================')
         # We got it!
 
